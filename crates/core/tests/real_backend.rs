@@ -25,7 +25,7 @@ use colab_playground_core::paths::HostPath;
 use colab_playground_core::plugins::InputValue;
 use colab_playground_core::provision::{ProvisionEvent, ProvisionSpec, WATCHDOG_ATTEMPTS};
 use colab_playground_core::real::{RealBackend, RealConfig};
-use colab_playground_core::sessions::{Accelerator, StopReason, WatchdogInfo};
+use colab_playground_core::sessions::{Accelerator, StopReason, TrackedSession, WatchdogInfo};
 use colab_playground_core::tunnel::{TunnelEvent, TunnelSpec, TunnelState};
 use colab_playground_core::vm::RunState;
 use colab_playground_core::{CancelToken, Defaults, ErrorKind, Host, ManualClock, Toolchain};
@@ -184,6 +184,13 @@ impl Fixture {
             .join("accounts")
             .join(id.as_str())
             .join("sessions.json")
+    }
+
+    fn ledger_entries(&self) -> Vec<TrackedSession> {
+        serde_json::from_str(
+            &std::fs::read_to_string(self.cfg.local_dir.join("ledger.json")).unwrap(),
+        )
+        .unwrap()
     }
 
     fn adopt_alice(&self) -> Account {
@@ -2009,6 +2016,16 @@ fn reused_session_name_with_different_endpoint_is_isolated_in_listing_switch_and
         // Stopping A must release A (not B) and mark A stopped while B stays running.
         f.b.stop_session(&rt_a.id, StopOptions::default(), &nc())
             .unwrap();
+        let entry_a = f
+            .ledger_entries()
+            .into_iter()
+            .find(|e| e.endpoint.as_deref() == Some(ep_a.as_str()))
+            .expect("ledger entry for A");
+        assert_eq!(
+            entry_a.stopped.as_ref().map(|s| &s.reason),
+            Some(&StopReason::User),
+            "stop_session must record StopReason::User for A before reconciliation"
+        );
         let left = f.assignments("alice");
         assert!(!left.contains_key(&ep_a), "A should be stopped");
         assert!(left.contains_key(&ep_b), "B must not be stopped");
@@ -2144,6 +2161,17 @@ fn stale_name_only_stop_uses_tracked_endpoint_and_preserves_remapped_runtime() {
     f.b.stop_session(&stale_ref, StopOptions::default(), &nc())
         .unwrap();
 
+    let entry_a = f
+        .ledger_entries()
+        .into_iter()
+        .find(|e| e.endpoint.as_deref() == Some(ep_a.as_str()))
+        .expect("ledger entry for A");
+    assert_eq!(
+        entry_a.stopped.as_ref().map(|s| &s.reason),
+        Some(&StopReason::User),
+        "stale name-only stop must record StopReason::User for A before reconciliation"
+    );
+
     let left = f.assignments("alice");
     assert!(
         !left.contains_key(&ep_a),
@@ -2232,5 +2260,206 @@ fn stop_does_not_mark_a_replacement_session_with_the_same_name_stopped() {
         state["same"]["endpoint"].as_str(),
         Some(ep_b.as_str()),
         "sessions.json must still map the reused name to replacement B"
+    );
+}
+
+#[test]
+fn explicit_endpoint_stop_leaves_unconfirmed_same_name_ledger_entry_live() {
+    let mut f = fixture();
+    let alice = f.adopt_alice();
+    f.provision("same", Accelerator::T4);
+    let ep_a = f.assignments("alice").keys().next().unwrap().clone();
+    let ep_b = "ep-unmanaged-b".to_owned();
+
+    // Simulate A's ledger entry still lacking a confirmed endpoint while external B
+    // took the same name in `sessions.json`.
+    let ledger_file = f.cfg.local_dir.join("ledger.json");
+    let mut ledger: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger_file).unwrap()).unwrap();
+    ledger[0]["endpoint"] = Value::Null;
+    std::fs::write(&ledger_file, ledger.to_string()).unwrap();
+    f.b = RealBackend::new(f.cfg.clone()).unwrap();
+
+    f.edit_server(|s| {
+        s["accounts"]["alice"]["assignments"][&ep_b] = json!({
+            "endpoint": ep_b,
+            "accelerator": "L4",
+            "variant": "GPU",
+            "machineShape": "STANDARD"
+        });
+    });
+    std::fs::write(
+        f.state_file(&alice.id),
+        json!({ "same": { "endpoint": ep_b } }).to_string(),
+    )
+    .unwrap();
+
+    let target_b = RuntimeRef {
+        account: alice.id.clone(),
+        endpoint: ep_b.clone(),
+        name: Some("same".into()),
+    };
+    f.b.stop_session(&target_b, StopOptions::default(), &nc())
+        .unwrap();
+
+    let left = f.assignments("alice");
+    assert!(!left.contains_key(&ep_b), "B should be stopped");
+    assert!(left.contains_key(&ep_a), "A must remain running");
+    let entries = f.ledger_entries();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].stopped.is_none(),
+        "stopping explicit endpoint B must leave unconfirmed ledger entry live"
+    );
+}
+
+#[test]
+fn unmanaged_named_runtime_lists_and_closes_tunnel_without_closing_tracked_same_name() {
+    let f = fixture();
+    let alice = f.adopt_alice();
+
+    // Part 1: Unmanaged named runtime keeps its tunnel listed and closes it on stop.
+    let ep_ext = "ep-unmanaged-ext".to_owned();
+    f.edit_server(|s| {
+        s["accounts"]["alice"]["assignments"][&ep_ext] = json!({
+            "endpoint": ep_ext,
+            "accelerator": "T4",
+            "variant": "GPU",
+            "machineShape": "STANDARD"
+        });
+    });
+    let state_file = f.state_file(&alice.id);
+    std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &state_file,
+        json!({ "ext": { "endpoint": ep_ext } }).to_string(),
+    )
+    .unwrap();
+    let (tx, rx) = channel();
+    let ext_tid =
+        f.b.open_tunnel(
+            TunnelSpec {
+                account: alice.id.clone(),
+                session: "ext".into(),
+                local_port: free_port(),
+                remote_port: 8000,
+                health_path: None,
+            },
+            tx,
+        )
+        .unwrap();
+    assert!(
+        wait_for(&rx, 60, |e| matches!(
+            e,
+            TunnelEvent::State {
+                state: TunnelState::Up,
+                ..
+            }
+        ))
+        .is_some(),
+        "unmanaged tunnel never came up"
+    );
+    let view = f.b.runtimes(&nc()).unwrap();
+    let rt_ext = view
+        .runtimes
+        .iter()
+        .find(|r| r.id.endpoint == ep_ext)
+        .unwrap();
+    assert!(!rt_ext.managed);
+    assert_eq!(rt_ext.tunnels, vec![ext_tid]);
+    f.b.stop_session(&rt_ext.id, StopOptions::default(), &nc())
+        .unwrap();
+    assert!(
+        f.b.tunnels().is_empty(),
+        "stopping unmanaged named runtime must close its tunnel"
+    );
+
+    // Part 2: When unmanaged B reuses tracked A's name, A keeps the tunnel card and
+    // stopping B must not close A's tunnel.
+    f.provision("same", Accelerator::T4);
+    let ep_a = f.assignments("alice").keys().next().unwrap().clone();
+    let (tx, rx) = channel();
+    let a_tid =
+        f.b.open_tunnel(
+            TunnelSpec {
+                account: alice.id.clone(),
+                session: "same".into(),
+                local_port: free_port(),
+                remote_port: 8001,
+                health_path: None,
+            },
+            tx,
+        )
+        .unwrap();
+    assert!(
+        wait_for(&rx, 60, |e| matches!(
+            e,
+            TunnelEvent::State {
+                state: TunnelState::Up,
+                ..
+            }
+        ))
+        .is_some(),
+        "managed tunnel never came up"
+    );
+    let ep_b = "ep-reused-b".to_owned();
+    f.edit_server(|s| {
+        s["accounts"]["alice"]["assignments"][&ep_b] = json!({
+            "endpoint": ep_b,
+            "accelerator": "L4",
+            "variant": "GPU",
+            "machineShape": "STANDARD"
+        });
+    });
+    std::fs::write(
+        f.state_file(&alice.id),
+        json!({ "same": { "endpoint": ep_b } }).to_string(),
+    )
+    .unwrap();
+    let view = f.b.runtimes(&nc()).unwrap();
+    let rt_a = view
+        .runtimes
+        .iter()
+        .find(|r| r.id.endpoint == ep_a)
+        .unwrap();
+    let rt_b = view
+        .runtimes
+        .iter()
+        .find(|r| r.id.endpoint == ep_b)
+        .unwrap();
+    assert_eq!(rt_a.tunnels, vec![a_tid]);
+    assert!(
+        rt_b.tunnels.is_empty(),
+        "tunnel must not attach to both managed A and unmanaged B"
+    );
+    f.b.stop_session(&rt_b.id, StopOptions::default(), &nc())
+        .unwrap();
+    assert!(
+        f.b.tunnels().iter().any(|t| t.id == a_tid),
+        "stopping unmanaged B must not close tracked A's tunnel"
+    );
+    f.b.close_tunnel(a_tid).unwrap();
+}
+
+#[test]
+fn stop_with_broken_helper_client_reaps_via_cli_and_records_stop() {
+    let f = fixture();
+    f.adopt_alice();
+    f.provision("managed", Accelerator::T4);
+    let rt_a = f.b.runtimes(&nc()).unwrap().runtimes[0].id.clone();
+
+    f.knob("cli_api_broken", json!(true));
+    f.b.stop_session(&rt_a, StopOptions::default(), &nc())
+        .unwrap();
+
+    assert!(
+        f.assignments("alice").is_empty(),
+        "CLI reap fallback must release the endpoint"
+    );
+    let entries = f.ledger_entries();
+    assert_eq!(
+        entries[0].stopped.as_ref().map(|s| &s.reason),
+        Some(&StopReason::User),
+        "successful CLI reap fallback must record StopReason::User even when helper cannot list"
     );
 }

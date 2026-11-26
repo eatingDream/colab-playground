@@ -847,27 +847,31 @@ impl Inner {
 
     fn stop(&self, target: &RuntimeRef, opts: &StopOptions, cancel: &CancelToken) -> Result<()> {
         let nc = CancelToken::new();
-        let tracked = {
+        let (tracked, tunnel_session) = {
             let st = self.st();
             let entry = if !target.endpoint.is_empty() {
                 st.ledger
                     .live_by_endpoint(&target.account, &target.endpoint)
-                    .or_else(|| {
-                        target.name.as_ref().and_then(|n| {
-                            st.ledger
-                                .live(&target.account, n)
-                                .filter(|e| e.endpoint.is_none())
-                        })
-                    })
             } else {
                 target
                     .name
                     .as_ref()
                     .and_then(|n| st.ledger.live(&target.account, n))
             };
-            entry.map(|e| (e.name.clone(), e.started_at(), e.endpoint.clone()))
+            let tracked = entry.map(|e| (e.name.clone(), e.started_at(), e.endpoint.clone()));
+            let tunnel_session = tracked
+                .as_ref()
+                .map(|(name, _, _)| name.clone())
+                .or_else(|| {
+                    target
+                        .name
+                        .as_ref()
+                        .filter(|name| st.ledger.live(&target.account, name).is_none())
+                        .cloned()
+                });
+            (tracked, tunnel_session)
         };
-        if let Some((name, _, _)) = &tracked {
+        if let Some(name) = &tunnel_session {
             self.tunnels.close_session(&target.account, name);
         }
         let endpoint = if !target.endpoint.is_empty() {
@@ -885,35 +889,48 @@ impl Inner {
             // race with the external CLI's own locked writes; Colab stops listing the
             // unassigned endpoint immediately and the CLI prunes stale entries itself.
             let helper = self.helper()?;
+            let mut reaped_via_cli = false;
             match helper.unassign(&target.account, endpoint, &nc) {
                 Ok(()) => {}
                 Err(e) if e.kind == ErrorKind::SessionGone => {}
                 Err(e) if e.kind == ErrorKind::UnsupportedCliVersion => {
                     let (_g, cli, _state) = self.cli_for(&target.account, cancel).map_err(|_| e)?;
                     let scratch = self.layout(&nc)?.host_scratch();
-                    cli.reap_endpoint(&scratch, endpoint, &nc)?;
+                    let _ = cli.reap_endpoint(&scratch, endpoint, &nc)?;
+                    reaped_via_cli = true;
                 }
                 Err(e) => return Err(e),
             }
-            // Verify: the endpoint must be gone from the server's list.
-            let listed = helper.assignments(std::slice::from_ref(&target.account), &nc)?;
-            let still = listed
-                .into_iter()
-                .find(|(a, _)| a == &target.account)
-                .map(|(_, r)| r.map(|list| list.iter().any(|x| x.endpoint == endpoint)));
-            match still {
-                Some(Ok(false)) => {}
-                Some(Ok(true)) => {
-                    return Err(Error::new(ErrorKind::OrphanSuspected).with("endpoint", endpoint));
-                }
-                Some(Err(e)) => {
-                    return Err(Error::new(ErrorKind::OrphanSuspected)
-                        .with("endpoint", endpoint)
-                        .detail(e.to_string()));
-                }
-                None => {
-                    return Err(Error::new(ErrorKind::OrphanSuspected).with("endpoint", endpoint));
-                }
+            // Verify: the endpoint must be gone from the server's list. When the helper's
+            // client itself is unavailable (`UnsupportedCliVersion`) and `cli.reap_endpoint`
+            // already succeeded, trust the CLI reap outcome so the stop is still recorded.
+            let verify_err = match helper.assignments(std::slice::from_ref(&target.account), &nc) {
+                Ok(listed) => match listed
+                    .into_iter()
+                    .find(|(a, _)| a == &target.account)
+                    .map(|(_, r)| r.map(|list| list.iter().any(|x| x.endpoint == endpoint)))
+                {
+                    Some(Ok(false)) => None,
+                    Some(Ok(true)) => {
+                        Some(Error::new(ErrorKind::OrphanSuspected).with("endpoint", endpoint))
+                    }
+                    Some(Err(e))
+                        if reaped_via_cli && e.kind == ErrorKind::UnsupportedCliVersion =>
+                    {
+                        None
+                    }
+                    Some(Err(e)) => Some(
+                        Error::new(ErrorKind::OrphanSuspected)
+                            .with("endpoint", endpoint)
+                            .detail(e.to_string()),
+                    ),
+                    None => Some(Error::new(ErrorKind::OrphanSuspected).with("endpoint", endpoint)),
+                },
+                Err(e) if reaped_via_cli && e.kind == ErrorKind::UnsupportedCliVersion => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(err) = verify_err {
+                return Err(err);
             }
         } else {
             let cli_name = target
@@ -1407,18 +1424,14 @@ impl Backend for RealBackend {
     }
 
     fn switch_impact(&self, to: &AccountId) -> Result<SwitchImpact> {
-        let st = self.inner.st();
-        if st.accounts.get(to).is_none() {
-            return Err(Error::new(ErrorKind::AccountNotFound).with("account", to));
-        }
-        let from = st.active.clone();
-        let sessions_left_running = from
-            .as_ref()
-            .filter(|from| *from != to)
-            .map(|from| st.ledger.live_of(from).cloned().collect())
-            .unwrap_or_default();
-        drop(st);
-        let tunnels_closing = if self.inner.st().active.as_ref() == Some(to) {
+        let from = {
+            let st = self.inner.st();
+            if st.accounts.get(to).is_none() {
+                return Err(Error::new(ErrorKind::AccountNotFound).with("account", to));
+            }
+            st.active.clone()
+        };
+        let tunnels_closing = if from.as_ref() == Some(to) {
             vec![]
         } else {
             self.inner
@@ -1432,23 +1445,11 @@ impl Backend for RealBackend {
         // helper (no switch needed). The usage reading cannot stand in for
         // the list: it is older than the question, and the sessions to
         // subtract from it may have ended.
+        let mut sessions_left_running = Vec::new();
         let mut unmanaged_left_running = Some(Vec::new());
         if let Some(f) = from.as_ref().filter(|f| *f != to) {
-            let unconfirmed: BTreeSet<String> = self
-                .inner
-                .st()
-                .ledger
-                .live_of(f)
-                .filter(|e| e.endpoint.is_none())
-                .map(|e| e.name.clone())
-                .collect();
-            let tracked: BTreeSet<String> = self
-                .inner
-                .st()
-                .ledger
-                .live_of(f)
-                .filter_map(|e| e.endpoint.clone())
-                .collect();
+            // Perform remote reads before taking one ledger snapshot so a
+            // concurrent confirmation cannot leave a stale name fallback active.
             // The helper reports a failure for one account inside an `Ok`, and
             // an account missing from its answer was not listed either.
             let listed = self
@@ -1458,17 +1459,30 @@ impl Backend for RealBackend {
                 .ok()
                 .and_then(|results| results.into_iter().find(|(a, _)| a == f))
                 .and_then(|(_, res)| res.ok());
-            unmanaged_left_running = listed.map(|assignments| {
-                let names = self
-                    .inner
+            let names = if listed.is_some() {
+                self.inner
                     .state_names(f, &CancelToken::new())
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+            } else {
+                BTreeMap::new()
+            };
+            sessions_left_running = self.inner.st().ledger.live_of(f).cloned().collect();
+            let tracked: BTreeSet<&str> = sessions_left_running
+                .iter()
+                .filter_map(|e| e.endpoint.as_deref())
+                .collect();
+            let unconfirmed: BTreeSet<&str> = sessions_left_running
+                .iter()
+                .filter(|e| e.endpoint.is_none())
+                .map(|e| e.name.as_str())
+                .collect();
+            unmanaged_left_running = listed.map(|assignments| {
                 assignments
                     .into_iter()
                     .filter_map(|a| {
                         let name = names.get(&a.endpoint).cloned();
-                        let managed = tracked.contains(&a.endpoint)
-                            || name.as_ref().is_some_and(|n| unconfirmed.contains(n));
+                        let managed = tracked.contains(a.endpoint.as_str())
+                            || name.as_deref().is_some_and(|n| unconfirmed.contains(n));
                         (!managed).then(|| RuntimeRef {
                             account: f.clone(),
                             endpoint: a.endpoint,
@@ -1596,6 +1610,11 @@ impl Backend for RealBackend {
             let st = self.inner.st();
             let email = st.accounts.get(&account).and_then(|a| a.email.clone());
             let usage = st.usage.get(&account);
+            let tracked_names: BTreeSet<&str> = list
+                .iter()
+                .filter_map(|a| st.ledger.live_by_endpoint(&account, &a.endpoint))
+                .map(|e| e.name.as_str())
+                .collect();
             for a in list {
                 let tracked = st.ledger.live_by_endpoint(&account, &a.endpoint).cloned();
                 let name = tracked
@@ -1605,6 +1624,10 @@ impl Backend for RealBackend {
                 let rate = tracked
                     .as_ref()
                     .and_then(|e| usage.and_then(|u| u.attribution.rate_of(&e.name)));
+                let tunnel_session = tracked
+                    .as_ref()
+                    .map(|e| e.name.as_str())
+                    .or_else(|| name.as_deref().filter(|n| !tracked_names.contains(n)));
                 view.runtimes.push(Runtime {
                     on_active_account: active.as_ref() == Some(&account),
                     account_email: email.clone(),
@@ -1623,7 +1646,7 @@ impl Backend for RealBackend {
                         .iter()
                         .filter(|t| {
                             t.spec.account == account
-                                && tracked.as_ref().is_some_and(|e| e.name == t.spec.session)
+                                && tunnel_session == Some(t.spec.session.as_str())
                         })
                         .map(|t| t.id)
                         .collect(),
