@@ -116,8 +116,8 @@ pub enum TunnelEvent {
 }
 
 /// `colab --config <state> ssh --proxy-mode -s <name>` as a shell string for
-/// OpenSSH's `ProxyCommand` (which expands `%` tokens before passing the
-/// command to a shell).
+/// OpenSSH's `ProxyCommand` (which expands `%` tokens in it, then always runs
+/// it through a shell).
 pub fn proxy_command(colab: &str, state_file: &HostPath, session: &str) -> String {
     format!(
         "{} --config {} ssh --proxy-mode -s {}",
