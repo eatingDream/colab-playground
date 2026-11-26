@@ -852,17 +852,41 @@ impl Inner {
 
     fn stop(&self, target: &RuntimeRef, opts: &StopOptions, cancel: &CancelToken) -> Result<()> {
         let nc = CancelToken::new();
-        let name = target.name.clone().or_else(|| {
-            self.st()
-                .ledger
-                .live_by_endpoint(&target.account, &target.endpoint)
-                .map(|e| e.name.clone())
-        });
-        if let Some(n) = &name {
+        let tracked_name = {
+            let st = self.st();
+            if !target.endpoint.is_empty() {
+                st.ledger
+                    .live_by_endpoint(&target.account, &target.endpoint)
+                    .map(|e| e.name.clone())
+                    .or_else(|| {
+                        target.name.as_ref().and_then(|n| {
+                            st.ledger
+                                .live(&target.account, n)
+                                .filter(|e| e.endpoint.is_none())
+                                .map(|e| e.name.clone())
+                        })
+                    })
+            } else {
+                target
+                    .name
+                    .as_ref()
+                    .and_then(|n| st.ledger.live(&target.account, n).map(|e| e.name.clone()))
+            }
+        };
+        if let Some(n) = &tracked_name {
             self.tunnels.close_session(&target.account, n);
         }
+        // Only stop through the CLI when its state file still maps the name to
+        // this exact endpoint (or the endpoint was never recorded). Otherwise a
+        // reused name in `sessions.json` would terminate a different runtime.
+        let cli_name = if target.endpoint.is_empty() {
+            target.name.clone().or_else(|| tracked_name.clone())
+        } else {
+            self.state_names(&target.account, cancel)
+                .and_then(|names| names.get(&target.endpoint).cloned())
+        };
         let mut stopped_by_cli = false;
-        if let Some(n) = &name
+        if let Some(n) = &cli_name
             && let Ok((_g, cli, state)) = self.cli_for(&target.account, cancel)
             && let Ok(StopOutcome::Terminated) = cli.stop(&state, n, &nc)
         {
@@ -907,7 +931,7 @@ impl Inner {
                 );
             }
         }
-        if let Some(n) = &name {
+        if let Some(n) = &tracked_name {
             self.mark_stopped(&target.account, n, opts.reason.clone());
         }
         Ok(())
@@ -1391,7 +1415,14 @@ impl Backend for RealBackend {
         // subtract from it may have ended.
         let mut unmanaged_left_running = Some(Vec::new());
         if let Some(f) = from.as_ref().filter(|f| *f != to) {
-            let live = self.inner.live_names(f);
+            let unconfirmed: BTreeSet<String> = self
+                .inner
+                .st()
+                .ledger
+                .live_of(f)
+                .filter(|e| e.endpoint.is_none())
+                .map(|e| e.name.clone())
+                .collect();
             let tracked: BTreeSet<String> = self
                 .inner
                 .st()
@@ -1418,7 +1449,7 @@ impl Backend for RealBackend {
                     .filter_map(|a| {
                         let name = names.get(&a.endpoint).cloned();
                         let managed = tracked.contains(&a.endpoint)
-                            || name.as_ref().is_some_and(|n| live.contains(n));
+                            || name.as_ref().is_some_and(|n| unconfirmed.contains(n));
                         (!managed).then(|| RuntimeRef {
                             account: f.clone(),
                             endpoint: a.endpoint,
@@ -1547,17 +1578,14 @@ impl Backend for RealBackend {
             let email = st.accounts.get(&account).and_then(|a| a.email.clone());
             let usage = st.usage.get(&account);
             for a in list {
-                let name = names.get(&a.endpoint).cloned().or_else(|| {
-                    st.ledger
-                        .live_by_endpoint(&account, &a.endpoint)
-                        .map(|e| e.name.clone())
-                });
-                let tracked = name
+                let tracked = st.ledger.live_by_endpoint(&account, &a.endpoint).cloned();
+                let name = tracked
                     .as_ref()
-                    .and_then(|n| st.ledger.live(&account, n).cloned());
-                let rate = name
+                    .map(|e| e.name.clone())
+                    .or_else(|| names.get(&a.endpoint).cloned());
+                let rate = tracked
                     .as_ref()
-                    .and_then(|n| usage.and_then(|u| u.attribution.rate_of(n)));
+                    .and_then(|e| usage.and_then(|u| u.attribution.rate_of(&e.name)));
                 view.runtimes.push(Runtime {
                     on_active_account: active.as_ref() == Some(&account),
                     account_email: email.clone(),
@@ -1569,13 +1597,14 @@ impl Backend for RealBackend {
                     },
                     high_mem: a.high_mem,
                     managed: tracked.is_some(),
-                    estimated_rate_cu_per_hour: rate.filter(|_| tracked.is_some()),
+                    estimated_rate_cu_per_hour: rate,
                     estimated_spend_cu: tracked.as_ref().and_then(|t| t.spend.spend()),
                     auto_stop_at: tracked.as_ref().and_then(|t| t.auto_stop_at()),
                     tunnels: tunnels
                         .iter()
                         .filter(|t| {
-                            t.spec.account == account && Some(&t.spec.session) == name.as_ref()
+                            t.spec.account == account
+                                && tracked.as_ref().is_some_and(|e| e.name == t.spec.session)
                         })
                         .map(|t| t.id)
                         .collect(),

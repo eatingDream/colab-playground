@@ -1952,3 +1952,107 @@ fn probe_blames_the_configured_path_when_nothing_runs_there() {
     let error = backend.probe(&nc()).unwrap_err();
     assert!(error.is(ErrorKind::InvalidInput), "{error}");
 }
+
+#[test]
+fn reused_session_name_with_different_endpoint_is_isolated_in_listing_switch_and_stop() {
+    // Part 1: Stopping the managed endpoint A when `sessions.json` was overwritten
+    // with unmanaged endpoint B under the same name terminates A (never B).
+    {
+        let f = fixture();
+        let alice = f.adopt_alice();
+        let bob = f.add_bob();
+        f.b.switch_account(&alice.id, &nc()).unwrap();
+        f.provision("same", Accelerator::T4);
+        let ep_a = f.assignments("alice").keys().next().unwrap().clone();
+        let ep_b = "ep-reused-b".to_owned();
+
+        // Simulate an external `colab new -s same` using this account's state file:
+        // endpoint B is allocated and overwrites `"same"` in `sessions.json`, while A stays live.
+        f.edit_server(|s| {
+            s["accounts"]["alice"]["assignments"][&ep_b] = json!({
+                "endpoint": ep_b,
+                "accelerator": "L4",
+                "variant": "GPU",
+                "machineShape": "STANDARD"
+            });
+        });
+        std::fs::write(
+            f.state_file(&alice.id),
+            json!({ "same": { "endpoint": ep_b } }).to_string(),
+        )
+        .unwrap();
+
+        let view = f.b.runtimes(&nc()).unwrap();
+        assert_eq!(view.runtimes.len(), 2);
+        let rt_a = view
+            .runtimes
+            .iter()
+            .find(|r| r.id.endpoint == ep_a)
+            .unwrap();
+        let rt_b = view
+            .runtimes
+            .iter()
+            .find(|r| r.id.endpoint == ep_b)
+            .unwrap();
+        assert!(rt_a.managed && rt_a.tracked.is_some());
+        assert!(!rt_b.managed && rt_b.tracked.is_none());
+        assert!(rt_b.auto_stop_at.is_none());
+        assert!(rt_b.estimated_spend_cu.is_none());
+
+        // Account switch impact must still report B as an unmanaged runtime.
+        let impact = f.b.switch_impact(&bob.id).unwrap();
+        assert_eq!(impact.sessions_left_running.len(), 1);
+        let unmanaged = impact.unmanaged_left_running.unwrap();
+        assert_eq!(unmanaged.len(), 1, "{unmanaged:?}");
+        assert_eq!(unmanaged[0].endpoint, ep_b);
+
+        // Stopping A must release A (not B) and mark A stopped while B stays running.
+        f.b.stop_session(&rt_a.id, StopOptions::default(), &nc())
+            .unwrap();
+        let left = f.assignments("alice");
+        assert!(!left.contains_key(&ep_a), "A should be stopped");
+        assert!(left.contains_key(&ep_b), "B must not be stopped");
+    }
+
+    // Part 2: Stopping unmanaged endpoint B must leave managed endpoint A running and tracked.
+    {
+        let f = fixture();
+        let alice = f.adopt_alice();
+        f.provision("same", Accelerator::T4);
+        let ep_a = f.assignments("alice").keys().next().unwrap().clone();
+        let ep_b = "ep-reused-b".to_owned();
+
+        f.edit_server(|s| {
+            s["accounts"]["alice"]["assignments"][&ep_b] = json!({
+                "endpoint": ep_b,
+                "accelerator": "L4",
+                "variant": "GPU",
+                "machineShape": "STANDARD"
+            });
+        });
+        std::fs::write(
+            f.state_file(&alice.id),
+            json!({ "same": { "endpoint": ep_b } }).to_string(),
+        )
+        .unwrap();
+
+        let view = f.b.runtimes(&nc()).unwrap();
+        let rt_b = view
+            .runtimes
+            .iter()
+            .find(|r| r.id.endpoint == ep_b)
+            .unwrap()
+            .id
+            .clone();
+        f.b.stop_session(&rt_b, StopOptions::default(), &nc())
+            .unwrap();
+
+        let after = f.b.runtimes(&nc()).unwrap();
+        assert_eq!(after.runtimes.len(), 1);
+        assert_eq!(after.runtimes[0].id.endpoint, ep_a);
+        assert!(
+            after.runtimes[0].managed,
+            "stopping unmanaged B must not mark managed A stopped in the ledger"
+        );
+    }
+}
