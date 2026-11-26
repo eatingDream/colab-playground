@@ -340,6 +340,10 @@ pub(super) const MESSAGES: Messages = &[
         SWITCH_SESSIONS,
         "These runtimes keep running and billing until they stop automatically:",
     ),
+    (
+        SWITCH_SESSIONS_UNWATCHED,
+        "These runtimes keep running and billing, with no automatic stop:",
+    ),
     (SWITCH_SESSION, "{name} ({hardware})"),
     (
         SWITCH_SESSION_DEADLINE,

@@ -367,6 +367,10 @@ pub(super) const MESSAGES: Messages = &[
         SWITCH_SESSIONS,
         "次のランタイムは、自動で停止するまで実行と課金が続きます：",
     ),
+    (
+        SWITCH_SESSIONS_UNWATCHED,
+        "次のランタイムは、自動停止なしで実行と課金が続きます：",
+    ),
     (SWITCH_SESSION, "{name}（{hardware}）"),
     (
         SWITCH_SESSION_DEADLINE,

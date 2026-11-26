@@ -303,6 +303,10 @@ pub(super) const MESSAGES: Messages = &[
         SWITCH_SESSIONS,
         "以下執行階段會繼續執行並計費，直到自動停止：",
     ),
+    (
+        SWITCH_SESSIONS_UNWATCHED,
+        "以下執行階段會繼續執行並計費，且不會自動停止：",
+    ),
     (SWITCH_SESSION, "{name}（{hardware}）"),
     (
         SWITCH_SESSION_DEADLINE,

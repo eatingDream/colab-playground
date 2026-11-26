@@ -220,6 +220,7 @@ catalog_keys! {
     SWITCH_TUNNELS => "app.switch.tunnels",
     SWITCH_TUNNEL => "app.switch.tunnel",
     SWITCH_SESSIONS => "app.switch.sessions",
+    SWITCH_SESSIONS_UNWATCHED => "app.switch.sessions_unwatched",
     SWITCH_SESSION => "app.switch.session",
     SWITCH_SESSION_DEADLINE => "app.switch.session_deadline",
     SWITCH_CONFIRM => "app.switch.confirm",

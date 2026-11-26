@@ -9,7 +9,9 @@ use colab_playground::{
     state::{AccountDialog, Load},
     ui::{
         dialogs::{
-            SWITCH_NOTHING_SELECTOR, SWITCH_UNMANAGED_UNKNOWN_SELECTOR, switch_session_selector,
+            SWITCH_NOTHING_SELECTOR, SWITCH_SESSIONS_UNWATCHED_SELECTOR,
+            SWITCH_SESSIONS_WATCHED_SELECTOR, SWITCH_UNMANAGED_UNKNOWN_SELECTOR,
+            switch_session_deadline_selector, switch_session_selector,
         },
         pages::{
             accounts::{ADD_SELECTOR, switch_selector},
@@ -248,4 +250,56 @@ fn switching_never_lets_usage_stand_in_for_runtimes_it_could_not_list(cx: &mut T
         "and the warning comes with them"
     );
     assert!(!app.shown(SWITCH_NOTHING_SELECTOR));
+}
+
+#[gpui::test]
+fn switching_never_promises_auto_stop_after_watchdog_is_cancelled(cx: &mut TestAppContext) {
+    use colab_playground_core::{CancelToken, backend::Backend as _};
+
+    let mut app = TestApp::new(cx);
+    let runtimes = app.mock.runtimes(&CancelToken::new()).unwrap().runtimes;
+    let a100 = runtimes
+        .iter()
+        .find(|r| r.id.name.as_deref() == Some("a100-7f3a"))
+        .unwrap()
+        .id
+        .clone();
+    let t4 = runtimes
+        .iter()
+        .find(|r| r.id.name.as_deref() == Some("t4-91c2"))
+        .unwrap()
+        .id
+        .clone();
+
+    // Cancel auto-stop on a100 while t4 keeps its armed watchdog.
+    app.mock
+        .cancel_auto_stop(&a100, &CancelToken::new())
+        .unwrap();
+    ask_to_switch(&mut app);
+    assert!(
+        app.shown(SWITCH_SESSIONS_WATCHED_SELECTOR),
+        "t4 still stops automatically"
+    );
+    assert!(app.shown(&switch_session_deadline_selector("t4-91c2")));
+    assert!(
+        app.shown(SWITCH_SESSIONS_UNWATCHED_SELECTOR),
+        "a100 is grouped as having no automatic stop"
+    );
+    assert!(app.shown(&switch_session_selector("a100-7f3a")));
+    assert!(
+        !app.shown(&switch_session_deadline_selector("a100-7f3a")),
+        "cancelled watchdog must not display a countdown"
+    );
+
+    // Cancel auto-stop on the remaining managed session too.
+    app.click("dialog-cancel");
+    app.mock.cancel_auto_stop(&t4, &CancelToken::new()).unwrap();
+    ask_to_switch(&mut app);
+    assert!(
+        !app.shown(SWITCH_SESSIONS_WATCHED_SELECTOR),
+        "auto-stop heading disappears when no watchdog is armed"
+    );
+    assert!(app.shown(SWITCH_SESSIONS_UNWATCHED_SELECTOR));
+    assert!(!app.shown(&switch_session_deadline_selector("a100-7f3a")));
+    assert!(!app.shown(&switch_session_deadline_selector("t4-91c2")));
 }
