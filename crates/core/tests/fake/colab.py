@@ -393,6 +393,19 @@ def cmd_ssh(state_path, args):
         fc.save_server(s)
         records[session] = {"name": session, "token": "t", "url": "u", "endpoint": ep}
         save_state(state_path, records)
+    else:
+        # Real CLI behaviour: when the name is in `sessions.json` but its runtime
+        # is already gone server-side, `_resolve_session` prunes it and exits
+        # without auto-creating a replacement runtime.
+        mine = fc.account_state(s, name)["assignments"]
+        if records[session]["endpoint"] not in mine:
+            del records[session]
+            save_state(state_path, records)
+            err(
+                "[colab] session '%s' not found. Run `colab sessions` to list active sessions."
+                % session
+            )
+            return 2
     if s["knobs"]["ssh_busy"]:
         err("[colab] Already-active SSH session (HTTP 429): another `colab ssh` is connected to this runtime. Disconnect it and retry.")
         return 1

@@ -2108,7 +2108,65 @@ fn stop_by_endpoint_ignores_a_remapped_state_file_and_keeps_the_remapped_entry()
     assert_eq!(
         state["same"]["endpoint"].as_str(),
         Some(ep_b.as_str()),
-        "pruning stopped endpoint A must keep the remapped entry for B"
+        "stopping endpoint A must keep the remapped entry for B"
+    );
+}
+
+#[test]
+fn stale_name_only_stop_uses_tracked_endpoint_and_preserves_remapped_runtime() {
+    let f = fixture();
+    let alice = f.adopt_alice();
+    f.provision("same", Accelerator::T4);
+    let ep_a = f.assignments("alice").keys().next().unwrap().clone();
+    let ep_b = "ep-remapped-b".to_owned();
+
+    // Another runtime B is created externally under the same name, overwriting `sessions.json`,
+    // while the caller holds a stale name-only RuntimeRef for `"same"`.
+    f.edit_server(|s| {
+        s["accounts"]["alice"]["assignments"][&ep_b] = json!({
+            "endpoint": ep_b,
+            "accelerator": "L4",
+            "variant": "GPU",
+            "machineShape": "STANDARD"
+        });
+    });
+    std::fs::write(
+        f.state_file(&alice.id),
+        json!({ "same": { "endpoint": ep_b } }).to_string(),
+    )
+    .unwrap();
+
+    let stale_ref = RuntimeRef {
+        account: alice.id.clone(),
+        endpoint: String::new(),
+        name: Some("same".into()),
+    };
+    f.b.stop_session(&stale_ref, StopOptions::default(), &nc())
+        .unwrap();
+
+    let left = f.assignments("alice");
+    assert!(
+        !left.contains_key(&ep_a),
+        "tracked endpoint A must be terminated"
+    );
+    assert!(
+        left.contains_key(&ep_b),
+        "remapped endpoint B must not be terminated"
+    );
+
+    let after = f.b.runtimes(&nc()).unwrap();
+    assert_eq!(after.runtimes.len(), 1);
+    assert_eq!(after.runtimes[0].id.endpoint, ep_b);
+    assert!(
+        !after.runtimes[0].managed && after.runtimes[0].tracked.is_none(),
+        "B remains unmanaged while tracked A is marked stopped"
+    );
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.state_file(&alice.id)).unwrap()).unwrap();
+    assert_eq!(
+        state["same"]["endpoint"].as_str(),
+        Some(ep_b.as_str()),
+        "sessions.json must still map the reused name to B"
     );
 }
 

@@ -357,10 +357,11 @@ def install_fake_modules():
 
             def unassign(self, endpoint):
                 s = server()
-                apply_state_remap(s)
+                remapped = apply_state_remap(s)
                 a = account_state(s, self.name)
                 if endpoint not in a["assignments"]:
-                    save_server(s)
+                    if remapped:
+                        save_server(s)
                     raise ColabRequestError(404)
                 del a["assignments"][endpoint]
                 barrier = s["knobs"].get("after_unassign_barrier")
@@ -375,6 +376,8 @@ def install_fake_modules():
                     deadline = time.monotonic() + 10.0
                     while not os.path.exists(barrier["go"]) and time.monotonic() < deadline:
                         time.sleep(0.02)
+                    if not os.path.exists(barrier["go"]):
+                        raise RuntimeError("unassign barrier timed out waiting for go")
 
         client.Client = Client
         client.Prod = Prod

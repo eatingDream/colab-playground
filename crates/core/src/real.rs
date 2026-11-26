@@ -746,28 +746,6 @@ impl Inner {
         }
     }
 
-    /// Removes any record in an account's state file that still maps to `endpoint`.
-    fn prune_state_endpoint(&self, account: &AccountId, endpoint: &str, cancel: &CancelToken) {
-        let Ok(layout) = self.layout(cancel) else {
-            return;
-        };
-        let path = layout.account_state(account);
-        let Ok(Some(text)) = self.fs().read(&path, cancel) else {
-            return;
-        };
-        let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
-        else {
-            return;
-        };
-        let before = map.len();
-        map.retain(|_, rec| rec.get("endpoint").and_then(|e| e.as_str()) != Some(endpoint));
-        if map.len() != before
-            && let Ok(bytes) = serde_json::to_vec_pretty(&map)
-        {
-            let _ = self.fs().write(&path, &bytes, cancel);
-        }
-    }
-
     /// Names recorded in an account's state file, by endpoint.
     fn state_names(
         &self,
@@ -892,7 +870,52 @@ impl Inner {
         if let Some((name, _, _)) = &tracked {
             self.tunnels.close_session(&target.account, name);
         }
-        if target.endpoint.is_empty() {
+        let endpoint = if !target.endpoint.is_empty() {
+            Some(target.endpoint.as_str())
+        } else {
+            tracked
+                .as_ref()
+                .and_then(|(_, _, ep)| ep.as_deref())
+                .filter(|ep| !ep.is_empty())
+        };
+        if let Some(endpoint) = endpoint {
+            // Stop by endpoint directly rather than resolving a name from `sessions.json`
+            // and calling `colab stop`, so a concurrent remap of that name can never
+            // terminate a different runtime. Leave `sessions.json` untouched so we never
+            // race with the external CLI's own locked writes; Colab stops listing the
+            // unassigned endpoint immediately and the CLI prunes stale entries itself.
+            let helper = self.helper()?;
+            match helper.unassign(&target.account, endpoint, &nc) {
+                Ok(()) => {}
+                Err(e) if e.kind == ErrorKind::SessionGone => {}
+                Err(e) if e.kind == ErrorKind::UnsupportedCliVersion => {
+                    let (_g, cli, _state) = self.cli_for(&target.account, cancel).map_err(|_| e)?;
+                    let scratch = self.layout(&nc)?.host_scratch();
+                    cli.reap_endpoint(&scratch, endpoint, &nc)?;
+                }
+                Err(e) => return Err(e),
+            }
+            // Verify: the endpoint must be gone from the server's list.
+            let listed = helper.assignments(std::slice::from_ref(&target.account), &nc)?;
+            let still = listed
+                .into_iter()
+                .find(|(a, _)| a == &target.account)
+                .map(|(_, r)| r.map(|list| list.iter().any(|x| x.endpoint == endpoint)));
+            match still {
+                Some(Ok(false)) => {}
+                Some(Ok(true)) => {
+                    return Err(Error::new(ErrorKind::OrphanSuspected).with("endpoint", endpoint));
+                }
+                Some(Err(e)) => {
+                    return Err(Error::new(ErrorKind::OrphanSuspected)
+                        .with("endpoint", endpoint)
+                        .detail(e.to_string()));
+                }
+                None => {
+                    return Err(Error::new(ErrorKind::OrphanSuspected).with("endpoint", endpoint));
+                }
+            }
+        } else {
             let cli_name = target
                 .name
                 .clone()
@@ -910,60 +933,19 @@ impl Inner {
                 return Err(Error::new(ErrorKind::OrphanSuspected)
                     .detail("the session's runtime is not known"));
             }
-        } else {
-            // Stop by endpoint directly rather than resolving a name from `sessions.json`
-            // and calling `colab stop`, so a concurrent remap of that name can never
-            // terminate a different runtime.
-            let helper = self.helper()?;
-            match helper.unassign(&target.account, &target.endpoint, &nc) {
-                Ok(()) => {}
-                Err(e) if e.kind == ErrorKind::SessionGone => {}
-                Err(e) if e.kind == ErrorKind::UnsupportedCliVersion => {
-                    let (_g, cli, _state) = self.cli_for(&target.account, cancel).map_err(|_| e)?;
-                    let scratch = self.layout(&nc)?.host_scratch();
-                    cli.reap_endpoint(&scratch, &target.endpoint, &nc)?;
-                }
-                Err(e) => return Err(e),
-            }
-            // Verify: the endpoint must be gone from the server's list.
-            let listed = helper.assignments(std::slice::from_ref(&target.account), &nc)?;
-            let still = listed
-                .into_iter()
-                .find(|(a, _)| a == &target.account)
-                .map(|(_, r)| r.map(|list| list.iter().any(|x| x.endpoint == target.endpoint)));
-            match still {
-                Some(Ok(false)) => {}
-                Some(Ok(true)) => {
-                    return Err(
-                        Error::new(ErrorKind::OrphanSuspected).with("endpoint", &target.endpoint)
-                    );
-                }
-                Some(Err(e)) => {
-                    return Err(Error::new(ErrorKind::OrphanSuspected)
-                        .with("endpoint", &target.endpoint)
-                        .detail(e.to_string()));
-                }
-                None => {
-                    return Err(
-                        Error::new(ErrorKind::OrphanSuspected).with("endpoint", &target.endpoint)
-                    );
-                }
-            }
-            self.prune_state_endpoint(&target.account, &target.endpoint, &nc);
         }
-        if let Some((name, started_at, endpoint)) = tracked {
+        if let Some((name, started_at, tracked_endpoint)) = &tracked {
             let now = self.now();
             let _ = self.st().ledger.mark_stopped_matching(
                 &target.account,
-                &name,
+                name,
                 |e| {
-                    e.started_at() == started_at
-                        && match &endpoint {
+                    e.started_at() == *started_at
+                        && match tracked_endpoint {
                             Some(ep) => e.endpoint.as_deref() == Some(ep.as_str()),
                             None => {
                                 e.endpoint.is_none()
-                                    || (!target.endpoint.is_empty()
-                                        && e.endpoint.as_deref() == Some(target.endpoint.as_str()))
+                                    || endpoint.is_some_and(|ep| e.endpoint.as_deref() == Some(ep))
                             }
                         }
                 },
