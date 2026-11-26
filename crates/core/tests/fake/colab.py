@@ -337,6 +337,9 @@ def record_history(session, env, code, result):
 def cmd_stop(state_path, args):
     name = require_account()
     session = opt(args, "-s", "--session")
+    s = fc.server()
+    if fc.apply_state_remap(s):
+        fc.save_server(s)
     records = load_state(state_path)
     rec = records.get(session)
     if rec is None:

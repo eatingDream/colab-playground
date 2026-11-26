@@ -427,9 +427,27 @@ impl Ledger {
         at: SystemTime,
         reason: StopReason,
     ) -> Result<bool> {
-        self.update(account, name, |e| {
-            e.stopped = Some(StopRecord { at, reason })
-        })
+        self.mark_stopped_matching(account, name, |_| true, at, reason)
+    }
+
+    /// Marks the live entry for `account`/`name` matching `predicate` as stopped,
+    /// leaving newer or replaced entries untouched.
+    pub fn mark_stopped_matching(
+        &mut self,
+        account: &AccountId,
+        name: &str,
+        predicate: impl Fn(&TrackedSession) -> bool,
+        at: SystemTime,
+        reason: StopReason,
+    ) -> Result<bool> {
+        let Some(e) = self.entries.iter_mut().rev().find(|e| {
+            &e.account == account && e.name == name && e.stopped.is_none() && predicate(e)
+        }) else {
+            return Ok(false);
+        };
+        e.stopped = Some(StopRecord { at, reason });
+        self.save()?;
+        Ok(true)
     }
 
     /// Applies a listing of `account`'s runtimes to its live entries: see [`reconcile`].
@@ -843,5 +861,55 @@ mod tests {
         let old: WatchdogInfo =
             serde_json::from_str(r#"{"deadline": 1000600, "cancelled": false}"#).unwrap();
         assert!(!old.armed);
+    }
+
+    #[test]
+    fn mark_stopped_matching_skips_a_replaced_entry_with_the_same_name() {
+        let acct = AccountId::new("a1").unwrap();
+        let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        let mut ledger = Ledger::in_memory();
+        let first = TrackedSession {
+            spend: SpendMeter::new(t(10)),
+            ..live("same", Some("ep-1"))
+        };
+        ledger.upsert(first.clone()).unwrap();
+
+        // A replacement session with the same name overwrites the live entry.
+        let replacement = TrackedSession {
+            spend: SpendMeter::new(t(20)),
+            ..live("same", Some("ep-2"))
+        };
+        ledger.upsert(replacement.clone()).unwrap();
+
+        let stopped = ledger
+            .mark_stopped_matching(
+                &acct,
+                "same",
+                |e| e.started_at() == first.started_at() && e.endpoint == first.endpoint,
+                t(30),
+                StopReason::User,
+            )
+            .unwrap();
+        assert!(!stopped, "must not mark the replacement entry stopped");
+        assert_eq!(
+            ledger
+                .live(&acct, "same")
+                .and_then(|e| e.endpoint.as_deref()),
+            Some("ep-2")
+        );
+
+        let stopped = ledger
+            .mark_stopped_matching(
+                &acct,
+                "same",
+                |e| {
+                    e.started_at() == replacement.started_at() && e.endpoint == replacement.endpoint
+                },
+                t(40),
+                StopReason::User,
+            )
+            .unwrap();
+        assert!(stopped);
+        assert!(ledger.live(&acct, "same").is_none());
     }
 }

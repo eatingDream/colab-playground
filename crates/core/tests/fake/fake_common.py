@@ -49,6 +49,8 @@ DEFAULT_KNOBS = {
     "keyring_locked": False,        # keyring reads fail
     "cli_api_broken": False,        # colab_cli.client cannot be imported
     "keyring_during_refresh": None,  # {"<service>\u0000<user>": value or null}, applied by the next token refresh
+    "remap_state_before_stop": None,  # {"path": ..., "name": ..., "endpoint": ...}, applied on next stop/unassign
+    "after_unassign_barrier": None,  # {"endpoint": ..., "ready": ..., "go": ...}, pauses after deleting endpoint
 }
 
 
@@ -154,6 +156,19 @@ def land_keyring_changes():
 def slot_account():
     raw = kr_get("google-colab-cli", "oauth_token")
     return account_of_token(raw) if raw else None
+
+
+def apply_state_remap(s):
+    remap = s["knobs"].get("remap_state_before_stop")
+    if not remap:
+        return False
+    s["knobs"]["remap_state_before_stop"] = None
+    path = remap["path"]
+    records = _read(path, {})
+    records[remap["name"]] = {"name": remap["name"], "endpoint": remap["endpoint"]}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write(path, records)
+    return True
 
 
 def account_state(s, name):
@@ -342,11 +357,24 @@ def install_fake_modules():
 
             def unassign(self, endpoint):
                 s = server()
+                apply_state_remap(s)
                 a = account_state(s, self.name)
                 if endpoint not in a["assignments"]:
+                    save_server(s)
                     raise ColabRequestError(404)
                 del a["assignments"][endpoint]
+                barrier = s["knobs"].get("after_unassign_barrier")
+                if barrier and barrier.get("endpoint") == endpoint:
+                    s["knobs"]["after_unassign_barrier"] = None
+                else:
+                    barrier = None
                 save_server(s)
+                if barrier:
+                    with open(barrier["ready"], "w") as fh:
+                        fh.write("ready")
+                    deadline = time.monotonic() + 10.0
+                    while not os.path.exists(barrier["go"]) and time.monotonic() < deadline:
+                        time.sleep(0.02)
 
         client.Client = Client
         client.Prod = Prod

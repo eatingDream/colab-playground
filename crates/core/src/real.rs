@@ -746,9 +746,26 @@ impl Inner {
         }
     }
 
-    fn mark_stopped(&self, account: &AccountId, name: &str, reason: StopReason) {
-        let now = self.now();
-        let _ = self.st().ledger.mark_stopped(account, name, now, reason);
+    /// Removes any record in an account's state file that still maps to `endpoint`.
+    fn prune_state_endpoint(&self, account: &AccountId, endpoint: &str, cancel: &CancelToken) {
+        let Ok(layout) = self.layout(cancel) else {
+            return;
+        };
+        let path = layout.account_state(account);
+        let Ok(Some(text)) = self.fs().read(&path, cancel) else {
+            return;
+        };
+        let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
+        else {
+            return;
+        };
+        let before = map.len();
+        map.retain(|_, rec| rec.get("endpoint").and_then(|e| e.as_str()) != Some(endpoint));
+        if map.len() != before
+            && let Ok(bytes) = serde_json::to_vec_pretty(&map)
+        {
+            let _ = self.fs().write(&path, &bytes, cancel);
+        }
     }
 
     /// Names recorded in an account's state file, by endpoint.
@@ -852,87 +869,107 @@ impl Inner {
 
     fn stop(&self, target: &RuntimeRef, opts: &StopOptions, cancel: &CancelToken) -> Result<()> {
         let nc = CancelToken::new();
-        let tracked_name = {
+        let tracked = {
             let st = self.st();
-            if !target.endpoint.is_empty() {
+            let entry = if !target.endpoint.is_empty() {
                 st.ledger
                     .live_by_endpoint(&target.account, &target.endpoint)
-                    .map(|e| e.name.clone())
                     .or_else(|| {
                         target.name.as_ref().and_then(|n| {
                             st.ledger
                                 .live(&target.account, n)
                                 .filter(|e| e.endpoint.is_none())
-                                .map(|e| e.name.clone())
                         })
                     })
             } else {
                 target
                     .name
                     .as_ref()
-                    .and_then(|n| st.ledger.live(&target.account, n).map(|e| e.name.clone()))
+                    .and_then(|n| st.ledger.live(&target.account, n))
+            };
+            entry.map(|e| (e.name.clone(), e.started_at(), e.endpoint.clone()))
+        };
+        if let Some((name, _, _)) = &tracked {
+            self.tunnels.close_session(&target.account, name);
+        }
+        if target.endpoint.is_empty() {
+            let cli_name = target
+                .name
+                .clone()
+                .or_else(|| tracked.as_ref().map(|(n, _, _)| n.clone()));
+            let mut stopped_by_cli = false;
+            if let Some(n) = &cli_name
+                && let Ok((_g, cli, state)) = self.cli_for(&target.account, cancel)
+                && let Ok(StopOutcome::Terminated) = cli.stop(&state, n, &nc)
+            {
+                stopped_by_cli = true;
             }
-        };
-        if let Some(n) = &tracked_name {
-            self.tunnels.close_session(&target.account, n);
-        }
-        // Only stop through the CLI when its state file still maps the name to
-        // this exact endpoint (or the endpoint was never recorded). Otherwise a
-        // reused name in `sessions.json` would terminate a different runtime.
-        let cli_name = if target.endpoint.is_empty() {
-            target.name.clone().or_else(|| tracked_name.clone())
+            // The CLI did not end it and there is no endpoint to release, so its runtime may still
+            // be billing; the session stays live until reconciliation can tell that it has ended.
+            if !stopped_by_cli {
+                return Err(Error::new(ErrorKind::OrphanSuspected)
+                    .detail("the session's runtime is not known"));
+            }
         } else {
-            self.state_names(&target.account, cancel)
-                .and_then(|names| names.get(&target.endpoint).cloned())
-        };
-        let mut stopped_by_cli = false;
-        if let Some(n) = &cli_name
-            && let Ok((_g, cli, state)) = self.cli_for(&target.account, cancel)
-            && let Ok(StopOutcome::Terminated) = cli.stop(&state, n, &nc)
-        {
-            stopped_by_cli = true;
-        }
-        // The CLI did not end it and there is no endpoint to release, so its runtime may still
-        // be billing; the session stays live until reconciliation can tell that it has ended.
-        if !stopped_by_cli && target.endpoint.is_empty() {
-            return Err(
-                Error::new(ErrorKind::OrphanSuspected).detail("the session's runtime is not known")
-            );
-        }
-        let helper = self.helper()?;
-        if !stopped_by_cli {
+            // Stop by endpoint directly rather than resolving a name from `sessions.json`
+            // and calling `colab stop`, so a concurrent remap of that name can never
+            // terminate a different runtime.
+            let helper = self.helper()?;
             match helper.unassign(&target.account, &target.endpoint, &nc) {
                 Ok(()) => {}
                 Err(e) if e.kind == ErrorKind::SessionGone => {}
+                Err(e) if e.kind == ErrorKind::UnsupportedCliVersion => {
+                    let (_g, cli, _state) = self.cli_for(&target.account, cancel).map_err(|_| e)?;
+                    let scratch = self.layout(&nc)?.host_scratch();
+                    cli.reap_endpoint(&scratch, &target.endpoint, &nc)?;
+                }
                 Err(e) => return Err(e),
             }
+            // Verify: the endpoint must be gone from the server's list.
+            let listed = helper.assignments(std::slice::from_ref(&target.account), &nc)?;
+            let still = listed
+                .into_iter()
+                .find(|(a, _)| a == &target.account)
+                .map(|(_, r)| r.map(|list| list.iter().any(|x| x.endpoint == target.endpoint)));
+            match still {
+                Some(Ok(false)) => {}
+                Some(Ok(true)) => {
+                    return Err(
+                        Error::new(ErrorKind::OrphanSuspected).with("endpoint", &target.endpoint)
+                    );
+                }
+                Some(Err(e)) => {
+                    return Err(Error::new(ErrorKind::OrphanSuspected)
+                        .with("endpoint", &target.endpoint)
+                        .detail(e.to_string()));
+                }
+                None => {
+                    return Err(
+                        Error::new(ErrorKind::OrphanSuspected).with("endpoint", &target.endpoint)
+                    );
+                }
+            }
+            self.prune_state_endpoint(&target.account, &target.endpoint, &nc);
         }
-        // Verify: the endpoint must be gone from the server's list.
-        let listed = helper.assignments(std::slice::from_ref(&target.account), &nc)?;
-        let still = listed
-            .into_iter()
-            .find(|(a, _)| a == &target.account)
-            .map(|(_, r)| r.map(|list| list.iter().any(|x| x.endpoint == target.endpoint)));
-        match still {
-            Some(Ok(false)) => {}
-            Some(Ok(true)) => {
-                return Err(
-                    Error::new(ErrorKind::OrphanSuspected).with("endpoint", &target.endpoint)
-                );
-            }
-            Some(Err(e)) => {
-                return Err(Error::new(ErrorKind::OrphanSuspected)
-                    .with("endpoint", &target.endpoint)
-                    .detail(e.to_string()));
-            }
-            None => {
-                return Err(
-                    Error::new(ErrorKind::OrphanSuspected).with("endpoint", &target.endpoint)
-                );
-            }
-        }
-        if let Some(n) = &tracked_name {
-            self.mark_stopped(&target.account, n, opts.reason.clone());
+        if let Some((name, started_at, endpoint)) = tracked {
+            let now = self.now();
+            let _ = self.st().ledger.mark_stopped_matching(
+                &target.account,
+                &name,
+                |e| {
+                    e.started_at() == started_at
+                        && match &endpoint {
+                            Some(ep) => e.endpoint.as_deref() == Some(ep.as_str()),
+                            None => {
+                                e.endpoint.is_none()
+                                    || (!target.endpoint.is_empty()
+                                        && e.endpoint.as_deref() == Some(target.endpoint.as_str()))
+                            }
+                        }
+                },
+                now,
+                opts.reason.clone(),
+            );
         }
         Ok(())
     }

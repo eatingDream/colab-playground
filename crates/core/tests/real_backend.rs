@@ -2056,3 +2056,123 @@ fn reused_session_name_with_different_endpoint_is_isolated_in_listing_switch_and
         );
     }
 }
+
+#[test]
+fn stop_by_endpoint_ignores_a_remapped_state_file_and_keeps_the_remapped_entry() {
+    let f = fixture();
+    let alice = f.adopt_alice();
+    f.provision("same", Accelerator::T4);
+    let ep_a = f.assignments("alice").keys().next().unwrap().clone();
+    let ep_b = "ep-remapped-b".to_owned();
+
+    // Another runtime exists on the account, while `sessions.json` still maps `"same"` -> A
+    // when `stop_session` begins.
+    f.edit_server(|s| {
+        s["accounts"]["alice"]["assignments"][&ep_b] = json!({
+            "endpoint": ep_b,
+            "accelerator": "L4",
+            "variant": "GPU",
+            "machineShape": "STANDARD"
+        });
+    });
+
+    let rt_a =
+        f.b.runtimes(&nc())
+            .unwrap()
+            .runtimes
+            .into_iter()
+            .find(|r| r.id.endpoint == ep_a)
+            .unwrap()
+            .id;
+
+    // Remap `"same"` -> B right before termination runs (the TOCTOU window between any
+    // `sessions.json` lookup and termination).
+    f.knob(
+        "remap_state_before_stop",
+        json!({
+            "path": f.state_file(&alice.id).to_string_lossy(),
+            "name": "same",
+            "endpoint": ep_b,
+        }),
+    );
+
+    f.b.stop_session(&rt_a, StopOptions::default(), &nc())
+        .unwrap();
+
+    let left = f.assignments("alice");
+    assert!(!left.contains_key(&ep_a), "A must be terminated");
+    assert!(left.contains_key(&ep_b), "B must remain running");
+
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.state_file(&alice.id)).unwrap()).unwrap();
+    assert_eq!(
+        state["same"]["endpoint"].as_str(),
+        Some(ep_b.as_str()),
+        "pruning stopped endpoint A must keep the remapped entry for B"
+    );
+}
+
+#[test]
+fn stop_does_not_mark_a_replacement_session_with_the_same_name_stopped() {
+    let f = fixture();
+    let alice = f.adopt_alice();
+    f.provision("same", Accelerator::T4);
+    let ep_a = f.assignments("alice").keys().next().unwrap().clone();
+    let rt_a =
+        f.b.runtimes(&nc())
+            .unwrap()
+            .runtimes
+            .into_iter()
+            .find(|r| r.id.endpoint == ep_a)
+            .unwrap()
+            .id;
+
+    let ready = f.state.join("unassign.ready");
+    let go = f.state.join("unassign.go");
+    f.knob(
+        "after_unassign_barrier",
+        json!({
+            "endpoint": ep_a,
+            "ready": ready.to_string_lossy(),
+            "go": go.to_string_lossy(),
+        }),
+    );
+
+    let backend = f.b.clone();
+    let stop_handle =
+        std::thread::spawn(move || backend.stop_session(&rt_a, StopOptions::default(), &nc()));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "stop did not reach unassign");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // While `stop_session` for A is still in flight after unassigning A, reuse the name `"same"`
+    // to provision a replacement runtime B.
+    f.provision("same", Accelerator::T4);
+    let ep_b = f
+        .assignments("alice")
+        .keys()
+        .find(|ep| ep.as_str() != ep_a)
+        .unwrap()
+        .clone();
+
+    std::fs::write(&go, "go").unwrap();
+    stop_handle.join().unwrap().unwrap();
+
+    let after = f.b.runtimes(&nc()).unwrap();
+    assert_eq!(after.runtimes.len(), 1);
+    assert_eq!(after.runtimes[0].id.endpoint, ep_b);
+    assert!(
+        after.runtimes[0].managed && after.runtimes[0].tracked.is_some(),
+        "completing stop for A must not mark replacement session B stopped"
+    );
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.state_file(&alice.id)).unwrap()).unwrap();
+    assert_eq!(
+        state["same"]["endpoint"].as_str(),
+        Some(ep_b.as_str()),
+        "sessions.json must still map the reused name to replacement B"
+    );
+}
