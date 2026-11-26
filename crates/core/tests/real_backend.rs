@@ -35,6 +35,7 @@ struct Fixture {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     state: PathBuf,
+    clock: Arc<ManualClock>,
     cfg: RealConfig,
     b: RealBackend,
 }
@@ -92,6 +93,7 @@ fn fixture() -> Fixture {
     });
     std::fs::write(state.join("server.json"), server.to_string()).unwrap();
     let s = |p: &Path| p.to_string_lossy().into_owned();
+    let clock = Arc::new(ManualClock::fixed());
     let cfg = RealConfig {
         host: Host::Local,
         toolchain: Some(Toolchain {
@@ -106,7 +108,7 @@ fn fixture() -> Fixture {
             ("CPG_SSH".into(), s(&bin.join("ssh"))),
             ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
         ],
-        clock: Arc::new(ManualClock::fixed()),
+        clock: clock.clone(),
         http: Arc::new(NoHttp),
         defaults: Defaults::default(),
         run_poll_interval: Duration::from_secs(1),
@@ -116,6 +118,7 @@ fn fixture() -> Fixture {
         _tmp: tmp,
         root,
         state,
+        clock,
         cfg,
         b,
     }
@@ -1107,6 +1110,11 @@ fn usage_guard_stop_and_vanished_sessions() {
     let r = f.b.guard_poll(&nc()).unwrap();
     assert_eq!(r.decisions.len(), 1);
     assert!(!r.decisions[0].stopped);
+    assert!(f.b.measured_rates().is_empty());
+    f.clock.advance(colab_playground_core::usage::MEASURE_HOLD);
+    let r = f.b.guard_poll(&nc()).unwrap();
+    assert_eq!(r.decisions.len(), 1);
+    assert!(!r.decisions[0].stopped);
     let rates = f.b.measured_rates();
     assert_eq!(rates.len(), 1, "{rates:?}");
     assert!(rates[0].matches(Accelerator::T4, false));
@@ -1163,7 +1171,11 @@ fn a_usage_round_writes_the_ledger_once() {
         for name in sessions {
             f.provision(name, Accelerator::T4);
         }
-        if ended {
+        if !ended {
+            // Prime attribution, then advance past MEASURE_HOLD so the next round settles.
+            f.b.refresh_usage(&[], &nc()).unwrap();
+            f.clock.advance(colab_playground_core::usage::MEASURE_HOLD);
+        } else {
             f.edit_server(|s| s["accounts"]["alice"]["assignments"] = json!({}));
         }
         let round = || {
@@ -1206,6 +1218,8 @@ fn session_under_its_floor(f: &Fixture) {
     };
     let (tx, _rx) = channel();
     f.b.provision(spec, tx, &nc()).unwrap();
+    f.b.refresh_usage(&[], &nc()).unwrap();
+    f.clock.advance(colab_playground_core::usage::MEASURE_HOLD);
     f.edit_server(|s| s["accounts"]["alice"]["balance"] = json!(30.0));
 }
 
@@ -1951,4 +1965,62 @@ fn probe_blames_the_configured_path_when_nothing_runs_there() {
     // `NotInstalled` would make the checklist offer an install that cannot help.
     let error = backend.probe(&nc()).unwrap_err();
     assert!(error.is(ErrorKind::InvalidInput), "{error}");
+}
+
+#[test]
+fn lagging_rate_after_stop_does_not_corrupt_persisted_measured_rate() {
+    let f = fixture();
+    f.adopt_alice();
+    f.provision("a100", Accelerator::A100);
+    f.provision("t4", Accelerator::T4);
+
+    // Both runtimes are burning together (11.77 + 1.76 = 13.53 CU/h).
+    f.b.guard_poll(&nc()).unwrap();
+    assert!(f.b.measured_rates().is_empty());
+
+    // Stop the A100 while Colab's consumptionRateHourly lags at 13.53 CU/h.
+    let a100 =
+        f.b.runtimes(&nc())
+            .unwrap()
+            .runtimes
+            .into_iter()
+            .find(|r| r.id.name.as_deref() == Some("a100"))
+            .unwrap()
+            .id;
+    f.edit_server(|s| s["accounts"]["alice"]["rate"] = json!(13.53));
+    f.b.stop_session(&a100, StopOptions::default(), &nc())
+        .unwrap();
+
+    // Even past MEASURE_HOLD, the lagging combined rate must never be persisted to T4.
+    for _ in 0..6 {
+        f.clock.advance(Duration::from_secs(30));
+        f.b.guard_poll(&nc()).unwrap();
+        assert!(
+            f.b.measured_rates().is_empty(),
+            "lagging combined rate was persisted: {:?}",
+            f.b.measured_rates()
+        );
+    }
+
+    // Once the account rate drops to T4's actual 1.76 CU/h and holds for MEASURE_HOLD,
+    // it is persisted to ledger.json and survives reload.
+    f.edit_server(|s| {
+        s["accounts"]["alice"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rate");
+    });
+    f.clock.advance(Duration::from_secs(30));
+    f.b.guard_poll(&nc()).unwrap();
+    assert!(
+        f.b.measured_rates().is_empty(),
+        "rate has not held for MEASURE_HOLD yet"
+    );
+
+    f.clock.advance(colab_playground_core::usage::MEASURE_HOLD);
+    f.b.guard_poll(&nc()).unwrap();
+    let persisted = RealBackend::new(f.cfg.clone()).unwrap().measured_rates();
+    assert_eq!(persisted.len(), 1, "{persisted:?}");
+    assert!(persisted[0].matches(Accelerator::T4, false));
+    assert_eq!(persisted[0].reading.cu_per_hour, 1.76);
 }

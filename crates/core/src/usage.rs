@@ -33,7 +33,7 @@ const NO_RATE: f64 = 1e-9;
 /// session is measured from it. Runtimes that go together can each leave the
 /// account rate at a time of their own, so the first fall need not be the
 /// last.
-const MEASURE_HOLD: Duration = Duration::from_secs(120);
+pub const MEASURE_HOLD: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -242,6 +242,23 @@ pub struct RateAttribution {
     remainder: Option<Remainder>,
 }
 
+/// Change to a session's settled burn-rate measurement produced by one
+/// [`RateAttribution::observe_at`] reading.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MeasurementUpdate {
+    /// The session's rate held for [`MEASURE_HOLD`] after the account rate
+    /// followed the last runtime change.
+    Settled {
+        name: String,
+        reading: RateReading,
+        /// True when this session was the account's only runtime.
+        sole: bool,
+    },
+    /// The account rate moved again while the same runtimes were running,
+    /// withdrawing the measurement settled during this spell.
+    Reverted { name: String },
+}
+
 /// The session that burns what the account rate leaves beside the sessions
 /// measured before, since the reading that found every other runtime of the
 /// account to be one of those.
@@ -329,7 +346,7 @@ impl RateAttribution {
         assignments: u32,
         live: &BTreeSet<String>,
         verified: bool,
-    ) {
+    ) -> Option<MeasurementUpdate> {
         let rate = account_rate.max(0.0);
         let moved = self.last_rate.map(|last| (last - rate).abs() > NO_RATE);
         let recounted = self.last_assignments.replace(assignments) != Some(assignments);
@@ -340,8 +357,9 @@ impl RateAttribution {
         // measurement covers.
         if live.len() != assignments as usize {
             self.remainder = None;
-            return;
+            return None;
         }
+        let mut update = None;
         let mut remainder = match self.remainder.take() {
             Some(mut remainder) if remainder.sessions == *live => {
                 if moved == Some(true) {
@@ -352,6 +370,9 @@ impl RateAttribution {
                             Some(r) => self.measured.insert(remainder.name.clone(), r),
                             None => self.measured.remove(&remainder.name),
                         };
+                        update = Some(MeasurementUpdate::Reverted {
+                            name: remainder.name.clone(),
+                        });
                     }
                     remainder.followed = true;
                     remainder.since = now;
@@ -373,7 +394,7 @@ impl RateAttribution {
                 };
                 let [name] = candidates.as_slice() else {
                     self.remainder = None;
-                    return;
+                    return None;
                 };
                 Remainder {
                     name: (*name).clone(),
@@ -403,11 +424,21 @@ impl RateAttribution {
             && held
             && left.is_finite()
             && left > NO_RATE
+            && remainder.replaced.is_none()
         {
             let before = self.measured.insert(remainder.name.clone(), left);
-            remainder.replaced.get_or_insert(before);
+            remainder.replaced = Some(before);
+            update = Some(MeasurementUpdate::Settled {
+                name: remainder.name.clone(),
+                reading: RateReading {
+                    cu_per_hour: left,
+                    at: now,
+                },
+                sole: live.len() == 1,
+            });
         }
         self.remainder = Some(remainder);
+        update
     }
 
     /// Estimated rate of a session (CU/h).
@@ -440,6 +471,10 @@ pub struct AccountUsage {
     #[serde(default, with = "serde_secs::option")]
     pub last_attempt: Option<SystemTime>,
     pub last_error: Option<Error>,
+    /// Ledger `measured_rate` replaced by the current settled spell, so a
+    /// rollback restores the exact previous reading (including timestamp).
+    #[serde(skip)]
+    replaced_readings: BTreeMap<String, Option<RateReading>>,
 }
 
 impl AccountUsage {
@@ -451,20 +486,50 @@ impl AccountUsage {
         now: SystemTime,
         live: &BTreeSet<String>,
         verified: bool,
-    ) {
+    ) -> Option<MeasurementUpdate> {
         self.snapshot = Some(UsageSnapshot::new(usage, now));
         self.managed_at_reading = Some(live.len());
         self.ownership_verified = live.is_empty() || verified;
         self.history.push(now, usage.balance_cu);
-        self.attribution.observe_at(
+        let update = self.attribution.observe_at(
             now,
             usage.rate_cu_per_hour,
             usage.assignments,
             live,
             verified,
         );
+        self.replaced_readings.retain(|name, _| live.contains(name));
         self.last_attempt = Some(now);
         self.last_error = None;
+        update
+    }
+
+    /// Applies a settled sole-session measurement (or its rollback) to the
+    /// ledger.
+    pub fn apply_measured_rate(
+        &mut self,
+        ledger: &mut crate::sessions::Ledger,
+        account: &crate::accounts::AccountId,
+        update: Option<MeasurementUpdate>,
+    ) {
+        match update {
+            Some(MeasurementUpdate::Settled {
+                name,
+                reading,
+                sole: true,
+            }) => {
+                ledger.change(account, &name, |e| {
+                    self.replaced_readings.insert(name.clone(), e.measured_rate);
+                    e.measured_rate = Some(reading);
+                });
+            }
+            Some(MeasurementUpdate::Reverted { name }) => {
+                if let Some(previous) = self.replaced_readings.remove(&name) {
+                    ledger.change(account, &name, |e| e.measured_rate = previous);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn record_failure(&mut self, error: Error, now: SystemTime) {
@@ -1068,5 +1133,84 @@ mod tests {
         let restored: AccountUsage =
             serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
         assert_eq!(restored.unmanaged_runtimes(0), 1);
+    }
+
+    #[test]
+    fn settled_measurement_rollback_restores_previous_ledger_reading() {
+        use crate::accounts::AccountId;
+        use crate::guard::{GuardPolicy, SpendMeter};
+        use crate::sessions::{Ledger, TrackedSession};
+
+        let acct = AccountId::new("a1").unwrap();
+        let mut ledger = Ledger::in_memory();
+        ledger
+            .upsert(TrackedSession {
+                name: "t4".into(),
+                account: acct.clone(),
+                endpoint: Some("ep-t4".into()),
+                accelerator: Accelerator::T4,
+                high_mem: false,
+                gpu: None,
+                vram_mib: None,
+                policy: GuardPolicy::unlimited(),
+                spend: SpendMeter::new(t(0)),
+                watchdog: None,
+                stopped: None,
+                measured_rate: None,
+            })
+            .unwrap();
+
+        let mut usage = AccountUsage::default();
+        let live = set(&["t4"]);
+        // Initial settled reading at 1.76.
+        let u0 = usage.record_success(u(50.0, 1.76, 1), t(0), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u0);
+        assert_eq!(ledger.live(&acct, "t4").unwrap().measured_rate, None);
+
+        let u1 = usage.record_success(u(49.9, 1.76, 1), t(120), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u1);
+        let original = RateReading {
+            cu_per_hour: 1.76,
+            at: t(120),
+        };
+        assert_eq!(
+            ledger.live(&acct, "t4").unwrap().measured_rate,
+            Some(original)
+        );
+
+        // A second session comes and goes, leaving a two-step fall: partial rate 5.0
+        // holds long enough to settle, then falls to 1.76 (rolling back 5.0 to `original`).
+        let both = set(&["a100", "t4"]);
+        let _ = usage.record_success(u(49.5, 13.53, 2), t(150), &both, true);
+        let u2 = usage.record_success(u(49.4, 5.0, 1), t(180), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u2);
+        let u3 = usage.record_success(u(49.2, 5.0, 1), t(300), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u3);
+        assert_eq!(
+            ledger.live(&acct, "t4").unwrap().measured_rate,
+            Some(RateReading {
+                cu_per_hour: 5.0,
+                at: t(300)
+            })
+        );
+
+        // Rate drops again during the same spell -> reverts to `original` (including its `at`).
+        let u4 = usage.record_success(u(49.1, 1.76, 1), t(330), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u4);
+        assert_eq!(
+            ledger.live(&acct, "t4").unwrap().measured_rate,
+            Some(original)
+        );
+
+        // Holding at 1.76 settles with the new timestamp.
+        let u5 = usage.record_success(u(49.0, 1.76, 1), t(450), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u5);
+        assert_eq!(
+            ledger.live(&acct, "t4").unwrap().measured_rate,
+            Some(RateReading {
+                cu_per_hour: 1.76,
+                at: t(450)
+            })
+        );
     }
 }
