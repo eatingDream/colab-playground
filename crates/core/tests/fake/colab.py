@@ -11,6 +11,7 @@ errors surface like kernel tracebacks) and the core's known snippets get
 simulated answers. State lives under ``$CPG_FAKE_STATE`` (see fake_common).
 """
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -378,6 +379,25 @@ def cmd_whoami(state_path, args):
     return 0
 
 
+TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
+
+
+def needs_token_refresh(rec, now=None):
+    raw = rec.get("token_expires_at")
+    if not raw:
+        return True
+    try:
+        text = raw[:-1] + "+00:00" if isinstance(raw, str) and raw.endswith("Z") else raw
+        expires_at = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return expires_at - now <= TOKEN_REFRESH_MARGIN
+
+
 def cmd_ssh(state_path, args):
     if "--proxy-mode" not in args:
         err("fake colab: only --proxy-mode is supported")
@@ -394,18 +414,25 @@ def cmd_ssh(state_path, args):
         records[session] = {"name": session, "token": "t", "url": "u", "endpoint": ep}
         save_state(state_path, records)
     else:
-        # Real CLI behaviour: when the name is in `sessions.json` but its runtime
-        # is already gone server-side, `_resolve_session` prunes it and exits
-        # without auto-creating a replacement runtime.
+        # Real CLI 0.8.0 behaviour: `get_session` checks assignments and prunes
+        # only when `token_expires_at` is missing or within TOKEN_REFRESH_MARGIN;
+        # a fresh cached record is retained and fails at WebSocket connect.
+        rec = records[session]
         mine = fc.account_state(s, name)["assignments"]
-        if records[session]["endpoint"] not in mine:
-            del records[session]
-            save_state(state_path, records)
+        if rec.get("endpoint") not in mine:
+            if needs_token_refresh(rec):
+                del records[session]
+                save_state(state_path, records)
+                err(
+                    "[colab] session '%s' not found. Run `colab sessions` to list active sessions."
+                    % session
+                )
+                return 2
             err(
-                "[colab] session '%s' not found. Run `colab sessions` to list active sessions."
-                % session
+                "[colab] Endpoint not found (HTTP 404): this runtime does not expose "
+                "the /colab/ssh endpoint."
             )
-            return 2
+            return 1
     if s["knobs"]["ssh_busy"]:
         err("[colab] Already-active SSH session (HTTP 429): another `colab ssh` is connected to this runtime. Disconnect it and retry.")
         return 1
