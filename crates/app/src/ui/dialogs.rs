@@ -41,6 +41,10 @@ pub fn switch_session_deadline_selector(name: &str) -> String {
     format!("switch-session-deadline {name}")
 }
 
+pub fn switch_session_app_only_selector(name: &str) -> String {
+    format!("switch-session-app-only {name}")
+}
+
 pub fn render(
     state: &AppState,
     handle: &Entity<AppState>,
@@ -288,17 +292,16 @@ fn impact_list(impact: &SwitchImpact, now: SystemTime, state: &AppState, cx: &Ap
                 ))
             }));
     }
-    let (watched, unwatched): (Vec<_>, Vec<_>) = impact
-        .sessions_left_running
-        .iter()
-        .map(|session| {
-            let deadline = session
-                .watchdog
-                .as_ref()
-                .and_then(|watchdog| watchdog.enforced_deadline());
-            (session, deadline)
-        })
-        .partition(|(_, deadline)| deadline.is_some());
+    // Switching leaves the app open, so the guard keeps enforcing app-side limits on every account.
+    let mut watched = Vec::new();
+    let mut unwatched = Vec::new();
+    for session in &impact.sessions_left_running {
+        if let Some(deadline) = session.auto_stop_at() {
+            watched.push((session, deadline));
+        } else {
+            unwatched.push(session);
+        }
+    }
     if !watched.is_empty() {
         list = list
             .child(tagged(
@@ -307,18 +310,31 @@ fn impact_list(impact: &SwitchImpact, now: SystemTime, state: &AppState, cx: &Ap
             ))
             .children(watched.into_iter().map(|(session, deadline)| {
                 let hardware = tr(cx, format::accelerator_key(session.accelerator)).to_string();
-                let left = deadline
-                    .and_then(|at| at.duration_since(now).ok())
-                    .unwrap_or_default();
+                let left = deadline.duration_since(now).unwrap_or_default();
+                let armed = session
+                    .watchdog
+                    .as_ref()
+                    .and_then(|watchdog| watchdog.enforced_deadline())
+                    .is_some();
+                let key = if armed {
+                    keys::SWITCH_SESSION_DEADLINE
+                } else {
+                    keys::SWITCH_SESSION_DEADLINE_APP_ONLY
+                };
                 let row = item(tr_args(
                     cx,
-                    keys::SWITCH_SESSION_DEADLINE,
+                    key,
                     &[
                         ("name", &session.name),
                         ("hardware", &hardware),
                         ("time", &format::duration(cx, left)),
                     ],
                 ));
+                let row = if armed {
+                    row
+                } else {
+                    tagged(switch_session_app_only_selector(&session.name), row)
+                };
                 tagged(
                     switch_session_selector(&session.name),
                     tagged(switch_session_deadline_selector(&session.name), row),
@@ -331,7 +347,7 @@ fn impact_list(impact: &SwitchImpact, now: SystemTime, state: &AppState, cx: &Ap
                 SWITCH_SESSIONS_UNWATCHED_SELECTOR,
                 Paragraph::new(tr(cx, keys::SWITCH_SESSIONS_UNWATCHED)),
             ))
-            .children(unwatched.into_iter().map(|(session, _)| {
+            .children(unwatched.into_iter().map(|session| {
                 let hardware = tr(cx, format::accelerator_key(session.accelerator)).to_string();
                 let row = item(tr_args(
                     cx,

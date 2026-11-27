@@ -376,6 +376,10 @@ pub(super) const MESSAGES: Messages = &[
         SWITCH_SESSION_DEADLINE,
         "{name}（{hardware}）、残り {time} で自動停止",
     ),
+    (
+        SWITCH_SESSION_DEADLINE_APP_ONLY,
+        "{name}（{hardware}）、残り {time} で自動停止（このアプリが開いている間のみ適用）",
+    ),
     (SWITCH_CONFIRM, "アカウントを切り替え"),
     (SWITCH_DONE, "{email} を使用しています"),
     (REMOVE_TITLE, "{email} を削除しますか？"),

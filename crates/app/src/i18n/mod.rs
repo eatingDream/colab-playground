@@ -223,6 +223,7 @@ catalog_keys! {
     SWITCH_SESSIONS_UNWATCHED => "app.switch.sessions_unwatched",
     SWITCH_SESSION => "app.switch.session",
     SWITCH_SESSION_DEADLINE => "app.switch.session_deadline",
+    SWITCH_SESSION_DEADLINE_APP_ONLY => "app.switch.session_deadline_app_only",
     SWITCH_CONFIRM => "app.switch.confirm",
     SWITCH_DONE => "app.switch.done",
     REMOVE_TITLE => "app.remove.title",

@@ -349,6 +349,10 @@ pub(super) const MESSAGES: Messages = &[
         SWITCH_SESSION_DEADLINE,
         "{name} ({hardware}), stops automatically in {time}",
     ),
+    (
+        SWITCH_SESSION_DEADLINE_APP_ONLY,
+        "{name} ({hardware}), stops automatically in {time} (applies only while this app is open)",
+    ),
     (SWITCH_CONFIRM, "Switch account"),
     (SWITCH_DONE, "Now using {email}"),
     (REMOVE_TITLE, "Remove {email}?"),

@@ -11,12 +11,17 @@ use colab_playground::{
         dialogs::{
             SWITCH_NOTHING_SELECTOR, SWITCH_SESSIONS_UNWATCHED_SELECTOR,
             SWITCH_SESSIONS_WATCHED_SELECTOR, SWITCH_UNMANAGED_UNKNOWN_SELECTOR,
-            switch_session_deadline_selector, switch_session_selector,
+            switch_session_app_only_selector, switch_session_deadline_selector,
+            switch_session_selector,
         },
+        overlays::CANCEL_AUTO_STOP_CONFIRM,
         pages::{
             accounts::{ADD_SELECTOR, switch_selector},
             overview::{RUNTIMES_INCOMPLETE_SELECTOR, RUNTIMES_UNCOUNTED_SELECTOR},
-            sessions::{EMPTY_PARTIAL_SELECTOR, EMPTY_SELECTOR},
+            sessions::{
+                EMPTY_PARTIAL_SELECTOR, EMPTY_SELECTOR, cancel_auto_stop_selector,
+                set_auto_stop_selector,
+            },
         },
     },
 };
@@ -281,6 +286,7 @@ fn switching_never_promises_auto_stop_after_watchdog_is_cancelled(cx: &mut TestA
         "t4 still stops automatically"
     );
     assert!(app.shown(&switch_session_deadline_selector("t4-91c2")));
+    assert!(!app.shown(&switch_session_app_only_selector("t4-91c2")));
     assert!(
         app.shown(SWITCH_SESSIONS_UNWATCHED_SELECTOR),
         "a100 is grouped as having no automatic stop"
@@ -290,6 +296,7 @@ fn switching_never_promises_auto_stop_after_watchdog_is_cancelled(cx: &mut TestA
         !app.shown(&switch_session_deadline_selector("a100-7f3a")),
         "cancelled watchdog must not display a countdown"
     );
+    assert!(!app.shown(&switch_session_app_only_selector("a100-7f3a")));
 
     // Cancel auto-stop on the remaining managed session too.
     app.click("dialog-cancel");
@@ -302,4 +309,50 @@ fn switching_never_promises_auto_stop_after_watchdog_is_cancelled(cx: &mut TestA
     assert!(app.shown(SWITCH_SESSIONS_UNWATCHED_SELECTOR));
     assert!(!app.shown(&switch_session_deadline_selector("a100-7f3a")));
     assert!(!app.shown(&switch_session_deadline_selector("t4-91c2")));
+}
+
+#[gpui::test]
+fn switching_groups_app_only_auto_stop_as_watched_and_notes_app_must_stay_open(
+    cx: &mut TestAppContext,
+) {
+    let mut app = TestApp::new(cx);
+    on_sessions(&mut app);
+    app.click(&cancel_auto_stop_selector("a100-7f3a"));
+    app.click(CANCEL_AUTO_STOP_CONFIRM);
+    app.set_failures(MockFailures {
+        watchdog_restart_fails: true,
+        ..MockFailures::default()
+    });
+    app.click(&set_auto_stop_selector("a100-7f3a"));
+
+    ask_to_switch(&mut app);
+    assert!(app.shown(SWITCH_SESSIONS_WATCHED_SELECTOR));
+    assert!(
+        !app.shown(SWITCH_SESSIONS_UNWATCHED_SELECTOR),
+        "app-side runtime limit still stops the session while the app stays open"
+    );
+    assert!(app.shown(&switch_session_deadline_selector("a100-7f3a")));
+    assert!(
+        app.shown(&switch_session_app_only_selector("a100-7f3a")),
+        "app-only limit notes that it applies only while the app is open"
+    );
+    assert!(app.shown(&switch_session_deadline_selector("t4-91c2")));
+    assert!(
+        !app.shown(&switch_session_app_only_selector("t4-91c2")),
+        "armed watchdog is not marked app-only"
+    );
+
+    // Cancel auto-stop on t4 so both groups appear alongside the app-only session.
+    app.click("dialog-cancel");
+    on_sessions(&mut app);
+    app.click(&cancel_auto_stop_selector("t4-91c2"));
+    app.click(CANCEL_AUTO_STOP_CONFIRM);
+    ask_to_switch(&mut app);
+    assert!(app.shown(SWITCH_SESSIONS_WATCHED_SELECTOR));
+    assert!(app.shown(&switch_session_deadline_selector("a100-7f3a")));
+    assert!(app.shown(&switch_session_app_only_selector("a100-7f3a")));
+    assert!(app.shown(SWITCH_SESSIONS_UNWATCHED_SELECTOR));
+    assert!(app.shown(&switch_session_selector("t4-91c2")));
+    assert!(!app.shown(&switch_session_deadline_selector("t4-91c2")));
+    assert!(!app.shown(&switch_session_app_only_selector("t4-91c2")));
 }

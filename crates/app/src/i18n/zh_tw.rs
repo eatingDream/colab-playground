@@ -312,6 +312,10 @@ pub(super) const MESSAGES: Messages = &[
         SWITCH_SESSION_DEADLINE,
         "{name}（{hardware}），{time}後自動停止",
     ),
+    (
+        SWITCH_SESSION_DEADLINE_APP_ONLY,
+        "{name}（{hardware}），{time}後自動停止（僅在本應用程式開啟時有效）",
+    ),
     (SWITCH_CONFIRM, "切換帳號"),
     (SWITCH_DONE, "已切換到 {email}"),
     (REMOVE_TITLE, "移除 {email}？"),

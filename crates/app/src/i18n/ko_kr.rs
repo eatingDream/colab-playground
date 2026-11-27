@@ -340,6 +340,10 @@ pub(super) const MESSAGES: Messages = &[
         SWITCH_SESSION_DEADLINE,
         "{name} ({hardware}), 자동 중지까지 {time}",
     ),
+    (
+        SWITCH_SESSION_DEADLINE_APP_ONLY,
+        "{name} ({hardware}), 자동 중지까지 {time} (이 앱이 열려 있는 동안에만 적용)",
+    ),
     (SWITCH_CONFIRM, "계정 전환"),
     (SWITCH_DONE, "이제 {email} 계정을 사용합니다"),
     (REMOVE_TITLE, "{email} 계정을 제거하시겠습니까?"),
