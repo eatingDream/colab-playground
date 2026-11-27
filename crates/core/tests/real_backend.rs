@@ -2023,4 +2023,12 @@ fn lagging_rate_after_stop_does_not_corrupt_persisted_measured_rate() {
     assert_eq!(persisted.len(), 1, "{persisted:?}");
     assert!(persisted[0].matches(Accelerator::T4, false));
     assert_eq!(persisted[0].reading.cu_per_hour, 1.76);
+
+    // Subsequent polls while the sole-runtime spell holds keep the saved timestamp fresh.
+    f.clock.advance(Duration::from_secs(60));
+    f.b.guard_poll(&nc()).unwrap();
+    let refreshed = RealBackend::new(f.cfg.clone()).unwrap().measured_rates();
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+    assert_eq!(refreshed[0].reading.cu_per_hour, 1.76);
+    assert!(refreshed[0].reading.at > persisted[0].reading.at);
 }

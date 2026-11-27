@@ -2451,10 +2451,10 @@ mod tests {
         m.refresh_usage(&[], &nc()).unwrap();
         let measured = rate(Accelerator::T4).unwrap();
         assert_eq!(measured.cu_per_hour, mock_rate(Accelerator::T4));
-        // A later guard round in the same stable spell keeps the settled timestamp.
+        // A guard round reads usage too, and keeps what it measured.
         clock.advance(Duration::from_secs(60));
         m.guard_poll(&nc()).unwrap();
-        assert_eq!(rate(Accelerator::T4), Some(measured));
+        assert!(rate(Accelerator::T4).unwrap().at > measured.at);
 
         // With two runtimes the account rate is the sum: neither is measured.
         start(Accelerator::A100);

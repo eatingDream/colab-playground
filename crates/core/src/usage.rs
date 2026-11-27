@@ -242,19 +242,16 @@ pub struct RateAttribution {
     remainder: Option<Remainder>,
 }
 
-/// Change to a session's settled burn-rate measurement produced by one
+/// Change to a sole session's settled burn-rate measurement produced by one
 /// [`RateAttribution::observe_at`] reading.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MeasurementUpdate {
-    /// The session's rate held for [`MEASURE_HOLD`] after the account rate
-    /// followed the last runtime change.
-    Settled {
-        name: String,
-        reading: RateReading,
-        /// True when this session was the account's only runtime.
-        sole: bool,
-    },
-    /// The account rate moved again while the same runtimes were running,
+    /// First reading after the sole session's rate held for [`MEASURE_HOLD`].
+    Settled { name: String, reading: RateReading },
+    /// Subsequent reading while the same sole-session spell holds, advancing
+    /// `reading.at`.
+    Refreshed { name: String, reading: RateReading },
+    /// The account rate moved again while the session was still alone,
     /// withdrawing the measurement settled during this spell.
     Reverted { name: String },
 }
@@ -370,9 +367,11 @@ impl RateAttribution {
                             Some(r) => self.measured.insert(remainder.name.clone(), r),
                             None => self.measured.remove(&remainder.name),
                         };
-                        update = Some(MeasurementUpdate::Reverted {
-                            name: remainder.name.clone(),
-                        });
+                        if live.len() == 1 {
+                            update = Some(MeasurementUpdate::Reverted {
+                                name: remainder.name.clone(),
+                            });
+                        }
                     }
                     remainder.followed = true;
                     remainder.since = now;
@@ -424,18 +423,27 @@ impl RateAttribution {
             && held
             && left.is_finite()
             && left > NO_RATE
-            && remainder.replaced.is_none()
         {
             let before = self.measured.insert(remainder.name.clone(), left);
-            remainder.replaced = Some(before);
-            update = Some(MeasurementUpdate::Settled {
-                name: remainder.name.clone(),
-                reading: RateReading {
+            let first = remainder.replaced.is_none();
+            remainder.replaced.get_or_insert(before);
+            if live.len() == 1 {
+                let reading = RateReading {
                     cu_per_hour: left,
                     at: now,
-                },
-                sole: live.len() == 1,
-            });
+                };
+                update = Some(if first {
+                    MeasurementUpdate::Settled {
+                        name: remainder.name.clone(),
+                        reading,
+                    }
+                } else {
+                    MeasurementUpdate::Refreshed {
+                        name: remainder.name.clone(),
+                        reading,
+                    }
+                });
+            }
         }
         self.remainder = Some(remainder);
         update
@@ -513,13 +521,14 @@ impl AccountUsage {
         update: Option<MeasurementUpdate>,
     ) {
         match update {
-            Some(MeasurementUpdate::Settled {
-                name,
-                reading,
-                sole: true,
-            }) => {
+            Some(MeasurementUpdate::Settled { name, reading }) => {
                 ledger.change(account, &name, |e| {
                     self.replaced_readings.insert(name.clone(), e.measured_rate);
+                    e.measured_rate = Some(reading);
+                });
+            }
+            Some(MeasurementUpdate::Refreshed { name, reading }) => {
+                ledger.change(account, &name, |e| {
                     e.measured_rate = Some(reading);
                 });
             }
@@ -528,7 +537,7 @@ impl AccountUsage {
                     ledger.change(account, &name, |e| e.measured_rate = previous);
                 }
             }
-            _ => {}
+            None => {}
         }
     }
 
@@ -1169,47 +1178,96 @@ mod tests {
 
         let u1 = usage.record_success(u(49.9, 1.76, 1), t(120), &live, true);
         usage.apply_measured_rate(&mut ledger, &acct, u1);
+        assert_eq!(
+            ledger.live(&acct, "t4").unwrap().measured_rate,
+            Some(RateReading {
+                cu_per_hour: 1.76,
+                at: t(120),
+            })
+        );
+
+        // Subsequent polls while the spell holds refresh `at`.
+        let u1b = usage.record_success(u(49.8, 1.76, 1), t(180), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u1b);
         let original = RateReading {
             cu_per_hour: 1.76,
-            at: t(120),
+            at: t(180),
         };
         assert_eq!(
             ledger.live(&acct, "t4").unwrap().measured_rate,
             Some(original)
         );
 
-        // A second session comes and goes, leaving a two-step fall: partial rate 5.0
-        // holds long enough to settle, then falls to 1.76 (rolling back 5.0 to `original`).
+        // A second session beside a measured one is a remainder, so even after
+        // holding for MEASURE_HOLD it stays out of the ledger.
+        ledger
+            .upsert(TrackedSession {
+                name: "a100".into(),
+                account: acct.clone(),
+                endpoint: Some("ep-a100".into()),
+                accelerator: Accelerator::A100,
+                high_mem: false,
+                gpu: None,
+                vram_mib: None,
+                policy: GuardPolicy::unlimited(),
+                spend: SpendMeter::new(t(210)),
+                watchdog: None,
+                stopped: None,
+                measured_rate: None,
+            })
+            .unwrap();
         let both = set(&["a100", "t4"]);
-        let _ = usage.record_success(u(49.5, 13.53, 2), t(150), &both, true);
-        let u2 = usage.record_success(u(49.4, 5.0, 1), t(180), &live, true);
+        let ub0 = usage.record_success(u(49.5, 13.53, 2), t(210), &both, true);
+        usage.apply_measured_rate(&mut ledger, &acct, ub0);
+        let ub1 = usage.record_success(u(49.1, 13.53, 2), t(330), &both, true);
+        usage.apply_measured_rate(&mut ledger, &acct, ub1);
+        assert_eq!(ledger.live(&acct, "a100").unwrap().measured_rate, None);
+        assert_eq!(
+            ledger.live(&acct, "t4").unwrap().measured_rate,
+            Some(original)
+        );
+
+        // The second session stops, leaving a two-step fall: partial rate 5.0
+        // settles and refreshes, then falls to 1.76 (rolling back 5.0 to `original`).
+        let u2 = usage.record_success(u(49.0, 5.0, 1), t(360), &live, true);
         usage.apply_measured_rate(&mut ledger, &acct, u2);
-        let u3 = usage.record_success(u(49.2, 5.0, 1), t(300), &live, true);
+        let u3 = usage.record_success(u(48.8, 5.0, 1), t(480), &live, true);
         usage.apply_measured_rate(&mut ledger, &acct, u3);
+        let u3b = usage.record_success(u(48.7, 5.0, 1), t(510), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u3b);
         assert_eq!(
             ledger.live(&acct, "t4").unwrap().measured_rate,
             Some(RateReading {
                 cu_per_hour: 5.0,
-                at: t(300)
+                at: t(510)
             })
         );
 
         // Rate drops again during the same spell -> reverts to `original` (including its `at`).
-        let u4 = usage.record_success(u(49.1, 1.76, 1), t(330), &live, true);
+        let u4 = usage.record_success(u(48.6, 1.76, 1), t(540), &live, true);
         usage.apply_measured_rate(&mut ledger, &acct, u4);
         assert_eq!(
             ledger.live(&acct, "t4").unwrap().measured_rate,
             Some(original)
         );
 
-        // Holding at 1.76 settles with the new timestamp.
-        let u5 = usage.record_success(u(49.0, 1.76, 1), t(450), &live, true);
+        // Holding at 1.76 settles with the new timestamp and keeps refreshing.
+        let u5 = usage.record_success(u(48.5, 1.76, 1), t(660), &live, true);
         usage.apply_measured_rate(&mut ledger, &acct, u5);
         assert_eq!(
             ledger.live(&acct, "t4").unwrap().measured_rate,
             Some(RateReading {
                 cu_per_hour: 1.76,
-                at: t(450)
+                at: t(660)
+            })
+        );
+        let u6 = usage.record_success(u(48.4, 1.76, 1), t(720), &live, true);
+        usage.apply_measured_rate(&mut ledger, &acct, u6);
+        assert_eq!(
+            ledger.live(&acct, "t4").unwrap().measured_rate,
+            Some(RateReading {
+                cu_per_hour: 1.76,
+                at: t(720)
             })
         );
     }
